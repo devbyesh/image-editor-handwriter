@@ -1,19 +1,19 @@
 import sys
-from contextlib import nullcontext
 
 import cv2
 from PyQt6.QtWidgets import *
-from PyQt6.QtCore import Qt, QRectF, QPoint
-from PyQt6.QtGui import QPixmap, QImageReader, QWheelEvent, QColor
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap, QWheelEvent, QColor, QImage
 
 import numpy as np
 
-img_path = None
 main_window = None
+
 
 class SelectImagePage(QWidget):
     def __init__(self):
         super().__init__()
+        self.img_path = None
         self.choose_file_btn = QPushButton("Select Image")
         self.choose_file_btn.clicked.connect(self.open_file_explorer)
 
@@ -30,37 +30,41 @@ class SelectImagePage(QWidget):
         self.show()
 
     def open_file_explorer(self):
-        global img_path, main_window
+        global main_window
         file_dialog = QFileDialog()
         img_path, _ = file_dialog.getOpenFileName(self, "Select an Image", "",
-                                                   "Images (*.png *.jpg *.jpeg)")
+                                                  "Images (*.png *.jpg *.jpeg)")
         self.close()
-        main_window = MainWindow()
+        main_window = MainWindow(img_path)
+
 
 class ImageEditor(QGraphicsView):
     def __init__(self, scn):
         super().__init__(scn)
-        #vars for transform tool
-        self.p1 = None
-        self.temp_line = None
-        self.lines = []
-        self.isTransforming = False
+        self.tooltips = [TransformTooltip()]
+        self.transformTooltip = self.tooltips[0]
 
-        #vars for image panning
+        # vars for image panning
         self.last_pos = None
         self.last_cursor = None
+        self.img = None
 
-        #layout init
+        # layout init
         self.scn: QGraphicsScene = scn
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.show()
 
+    def addImg(self, pixmap):
+        self.scn.clear()
+        self.scn.addPixmap(pixmap)
+        self.img = pixmap
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         zoom_factor = 1.2
         if event.angleDelta().y() < 0:
-            zoom_factor = 1/zoom_factor
+            zoom_factor = 1 / zoom_factor
         self.scale(zoom_factor, zoom_factor)
 
     def mousePressEvent(self, event):
@@ -70,8 +74,8 @@ class ImageEditor(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.last_pos = event.pos()
 
-        if self.isTransforming:
-            self.mousePressEventTRS(event)
+        for tooltip in self.tooltips:
+            tooltip.handle_event("mouse_press", event, self)
 
     def mouseMoveEvent(self, event):
         if self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag:
@@ -80,77 +84,65 @@ class ImageEditor(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             self.last_pos = event.pos()
 
-        if self.isTransforming:
-            self.mouseMoveEventTRS(event)
+        for tooltip in self.tooltips:
+            tooltip.handle_event("mouse_move", event, self)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
-            #deactivate panning
+            # deactivate panning
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.setCursor(self.last_cursor)
 
     def keyPressEvent(self, event):
-        if self.isTransforming:
-            self.keyPressEventTRS(event)
+        for tooltip in self.tooltips:
+            tooltip.handle_event("key_press", event, self)
 
-    def onTransformSelect(self):
-        self.isTransforming = True
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self.update()
+    def onTransformActivate(self):
+        self.transformTooltip.activate()
 
-    def mousePressEventTRS(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self.p1 is None:
-                self.p1 = self.mapToScene(event.pos())
-            else:
-                #remove old line
-                self.scn.removeItem(self.temp_line)
-                self.temp_line = None
 
-        if event.button() == Qt.MouseButton.RightButton:
-            if self.temp_line is not None:
-                #remove old line
-                self.scn.removeItem(self.temp_line)
+class Tooltip:
+    def __init__(self):
+        self.isActivated = False
 
-                #extend line to either end of page
-                m = (self.temp_line.line().y2() - self.temp_line.line().y1()) / (self.temp_line.line().x2() - self.temp_line.line().x1())
-                b = self.temp_line.line().y1() - m * self.temp_line.line().x1()
+    def activate(self):
+        self.isActivated = True
 
-                x2 = self.scn.sceneRect().width()
-                y2 = m*x2 + b
+    def deactivate(self):
+        if not self.isActivated:
+            raise Exception("Invalid state detected")
+        self.isActivated = False
 
-                self.lines.append(QGraphicsLineItem(0, b, x2, y2))
-                self.lines[-1].setPen(QColor("green"))
-                self.scn.addItem(self.lines[-1])
+    def handle_event(self, event_type, event, caller):
+        if not self.isActivated:
+            return
 
-                self.p1 = None
-                self.temp_line = None
+        # find on_{event_type} method and call it
+        method = getattr(self, f"on_{event_type}", None)
+        if method:
+            method(event, caller)
 
-    def mouseMoveEventTRS(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            if self.p1 is not None:
-                if self.temp_line is not None:
-                    self.scn.removeItem(self.temp_line)
-                    self.temp_line = None
 
-                p2 = self.mapToScene(event.pos())
-                self.temp_line = QGraphicsLineItem(self.p1.x(), self.p1.y(), p2.x(), p2.y())
-                self.scn.addItem(self.temp_line)
+class TransformTooltip(Tooltip):
+    def __init__(self):
+        super().__init__()
+        self.p1 = None
+        self.temp_line = None
+        self.lines = []
 
-    def keyPressEventTRS(self, event):
+    def on_key_press(self, event, context):
         if event.key() == Qt.Key.Key_Escape:
-            self.isTransforming = False
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            self.update()
+            self.deactivate()
+            context.setDragMode(QGraphicsView.DragMode.NoDrag)
+            context.setCursor(Qt.CursorShape.ArrowCursor)
+            context.update()
         if event.key() == Qt.Key.Key_Return:
-            self.isTransforming = False
+            self.deactivate()
             t_lines = []
             lines = []
             for line in self.lines:
                 t_lines.append((line.line().x1(), line.line().y1()))
-                t_lines.append((self.scn.sceneRect().width(), line.line().y1()))
+                t_lines.append((context.scn.sceneRect().width(), line.line().y1()))
                 lines.append((line.line().x1(), line.line().y1()))
                 lines.append((line.line().x2(), line.line().y2()))
 
@@ -158,14 +150,54 @@ class ImageEditor(QGraphicsView):
             lines = np.array(lines)
 
             H, status = cv2.findHomography(lines, t_lines)
-            img = cv2.imread(img_path)
-            img = cv2.warpPerspective(img, H, (self.width(), self.height()))
+            img = pixmap_to_cv2_image(context.img)
+            img = cv2.warpPerspective(img, H,
+                                      (int(context.scn.sceneRect().width()), int(context.scn.sceneRect().height())))
             cv2.imwrite("output.png", img)
-            self.scn.clear()
+            context.scn.clear()
             pixmap = QPixmap("output.png")
-            self.scn.addPixmap(pixmap)
-            self.update()
+            context.addImg(pixmap)
+            self.lines = []
 
+    def on_mouse_move(self, event, context):
+        if event.buttons() == Qt.MouseButton.LeftButton:
+            if self.p1 is not None:
+                if self.temp_line is not None:
+                    context.scn.removeItem(self.temp_line)
+                    self.temp_line = None
+
+                p2 = context.mapToScene(event.pos())
+                self.temp_line = QGraphicsLineItem(self.p1.x(), self.p1.y(), p2.x(), p2.y())
+                context.scn.addItem(self.temp_line)
+
+    def on_mouse_press(self, event, context):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.p1 is None:
+                self.p1 = context.mapToScene(event.pos())
+            else:
+                # remove old line
+                context.scn.removeItem(self.temp_line)
+                self.temp_line = None
+
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.temp_line is not None:
+                # remove old line
+                context.scn.removeItem(self.temp_line)
+
+                # extend line to either end of page
+                m = (self.temp_line.line().y2() - self.temp_line.line().y1()) / (
+                        self.temp_line.line().x2() - self.temp_line.line().x1())
+                b = self.temp_line.line().y1() - m * self.temp_line.line().x1()
+
+                x2 = context.scn.sceneRect().width()
+                y2 = m * x2 + b
+
+                self.lines.append(QGraphicsLineItem(0, b, x2, y2))
+                self.lines[-1].setPen(QColor("green"))
+                context.scn.addItem(self.lines[-1])
+
+                self.p1 = None
+                self.temp_line = None
 
 
 class SidePanel(QWidget):
@@ -176,7 +208,7 @@ class SidePanel(QWidget):
 
         # transform, auto char select, remove lines, recognize chars, change color
         tools = ["TRS", "ACS", "RML", "OCR", "CLR"]
-        events = [img_editor.onTransformSelect] * 5
+        events = [img_editor.onTransformActivate] * 5
         self.button_group = QButtonGroup()
         rows, cols = 4, 3
 
@@ -197,15 +229,15 @@ class SidePanel(QWidget):
 
 
 class MainWindow(QWidget):
-    def __init__(self):
+    def __init__(self, img_path):
         global img_editor
         super().__init__()
         layout = QHBoxLayout()
 
         scene = QGraphicsScene()
         pixmap = QPixmap(img_path)
-        scene.addPixmap(pixmap)
         img_editor = ImageEditor(scene)
+        img_editor.addImg(pixmap)
         self.side = SidePanel()
         layout.addWidget(self.side)
 
@@ -213,6 +245,19 @@ class MainWindow(QWidget):
         self.setLayout(layout)
         layout.addStretch()
         self.show()
+
+
+def pixmap_to_cv2_image(pixmap):
+    q_image = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32)  # QImage.Format_RGB32 (value = 4)
+    width, height = q_image.width(), q_image.height()
+
+    # Convert QImage to NumPy array
+    img = np.array(q_image.bits().asarray(width * height * 4)).reshape((height, width, 4))
+
+    # Convert RGBA to BGR for OpenCV
+    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    return img
+
 
 img_editor: ImageEditor = None
 
